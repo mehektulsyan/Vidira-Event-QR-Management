@@ -4,3 +4,4 @@ openpyxl
 qrcode[pil]
 Pillow
 requests
+streamlit-qrcode-scanner
