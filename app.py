@@ -623,7 +623,7 @@ def company_picker(guest_companies: list[str]) -> str:
 
 
 def page_registration():
-    st.header("🧾 Registration (Search company → Add members → Send WhatsApp QR images)")
+    st.header("🧾 Registration!")
 
     guest_companies = load_guest_companies()
 
