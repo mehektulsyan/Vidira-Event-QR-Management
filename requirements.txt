@@ -1,0 +1,6 @@
+streamlit
+pandas
+openpyxl
+qrcode[pil]
+Pillow
+requests
