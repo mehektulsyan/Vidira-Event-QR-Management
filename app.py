@@ -521,6 +521,81 @@ def camera_scan_component():
     except Exception:
         return None
 
+def kiosk_fullscreen_result(color: str, title: str, subtitle: str, beep: bool = True):
+    """
+    Full-screen overlay result with beep.
+    - color: 'green' or 'red'
+    - Call this right after every scan redemption.
+    """
+    palette = {
+        "green": ("#0f5132", "#00c853"),  # fg, bg accent
+        "red": ("#842029", "#ff1744"),
+    }
+    fg, accent = palette.get(color, ("#0c5460", "#17a2b8"))
+
+    # Beep tone: success high, fail low
+    beep_js = ""
+    if beep:
+        freq = 880 if color == "green" else 220
+        beep_js = f"""
+        <script>
+          (function() {{
+            try {{
+              const Ctx = window.AudioContext || window.webkitAudioContext;
+              const ctx = new Ctx();
+              const o = ctx.createOscillator();
+              const g = ctx.createGain();
+              o.type = "sine";
+              o.frequency.value = {freq};
+              g.gain.value = 0.22;
+              o.connect(g); g.connect(ctx.destination);
+              o.start();
+              setTimeout(() => {{ o.stop(); ctx.close(); }}, 140);
+            }} catch(e) {{}}
+          }})();
+        </script>
+        """
+
+    # Full-screen overlay div
+    html = f"""
+    <div id="kioskOverlay" style="
+        position: fixed; inset: 0;
+        background: {accent};
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 999999;
+        padding: 22px;
+    ">
+      <div style="
+          width: min(900px, 96vw);
+          background: rgba(255,255,255,0.92);
+          border-radius: 22px;
+          padding: 26px 22px;
+          box-shadow: 0 18px 60px rgba(0,0,0,0.25);
+          text-align: center;
+      ">
+        <div style="font-size: 64px; font-weight: 1000; color: {fg}; line-height: 1;">
+          {title}
+        </div>
+        <div style="font-size: 26px; font-weight: 800; color: {fg}; margin-top: 12px;">
+          {subtitle}
+        </div>
+        <div style="font-size: 16px; font-weight: 700; color: rgba(0,0,0,0.55); margin-top: 14px;">
+          (Auto-clears in 2 seconds)
+        </div>
+      </div>
+    </div>
+    {beep_js}
+    <script>
+      setTimeout(() => {{
+        const el = document.getElementById("kioskOverlay");
+        if (el) el.remove();
+      }}, 2000);
+    </script>
+    """
+    components.html(html, height=0)
+
 
 # ----------------------------
 # Pages
@@ -692,43 +767,50 @@ def page_registration():
 
 
 def page_scan():
-    st.header("📷 Counter Scan (Green = Approved, Red = Not allowed/Used)")
-    checkpoint = st.radio("Select counter", CHECKPOINTS, horizontal=True)
-    device = st.text_input("Device name (optional)", placeholder="e.g. Breakfast-1")
+    st.markdown("## 📷 Scan Kiosk")
+
+    # Make the counter selection super obvious
+    checkpoint = st.radio("Counter", CHECKPOINTS, horizontal=True)
+    device = st.text_input("Device name (optional)", placeholder="e.g. Breakfast-1 / Gift-1")
 
     st.divider()
-    st.subheader("Scan method A: Hardware scanner (recommended)")
-    st.caption("Click the input box once; scanner should be in keyboard/HID mode and send Enter after scan.")
+
+    # -------------- Hardware scanner flow --------------
+    st.subheader("A) Hardware Scanner (Recommended)")
+    st.caption("Click the scan box once, then keep scanning. Scanner should be in Keyboard/HID mode and send ENTER suffix.")
 
     if "scan_buf" not in st.session_state:
         st.session_state.scan_buf = ""
 
-    def on_scanned():
-        raw = st.session_state.scan_buf.strip()
-        if not raw:
+    def handle_token(token: str):
+        token = (token or "").strip().replace("\n", "").replace("\r", "")
+        if not token:
             return
-        color, title, subtitle = redeem(raw, checkpoint, device)
-        big_box(color, title, subtitle)
-        st.session_state.scan_buf = ""
+        color, title, subtitle = redeem(token, checkpoint, device)
+        # FULL SCREEN + BEEP
+        kiosk_fullscreen_result("green" if color == "green" else "red", title, subtitle, beep=True)
+
+    def on_scanned_input():
+        raw = st.session_state.scan_buf
+        st.session_state.scan_buf = ""  # clear immediately for next scan
+        handle_token(raw)
 
     st.text_input(
-        "Scan token here",
+        "Scan token here (keep focused)",
         key="scan_buf",
-        placeholder="Click here once, then scan…",
-        on_change=on_scanned,
+        placeholder="Tap here once, then scan…",
+        on_change=on_scanned_input,
     )
 
-    st.subheader("Scan method B: Phone camera (optional)")
+    st.divider()
+
+    # -------------- Phone camera flow --------------
+    st.subheader("B) Phone Camera Scan (Optional)")
+    st.caption("Works best on HTTPS (Streamlit Cloud is HTTPS by default).")
+
     scanned = camera_scan_component()
     if scanned:
-        color, title, subtitle = redeem(scanned, checkpoint, device)
-        big_box(color, title, subtitle)
-
-    st.subheader("Manual fallback")
-    token_manual = st.text_input("Paste token", key="manual_token")
-    if st.button("Redeem manual"):
-        color, title, subtitle = redeem(token_manual, checkpoint, device)
-        big_box(color, title, subtitle)
+        handle_token(scanned)
 
 
 def page_admin():
