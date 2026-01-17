@@ -14,7 +14,7 @@ import streamlit as st
 # ----------------------------
 # Config
 # ----------------------------
-DB_PATH = "event_qr.db"
+DB_PATH = os.path.join(os.path.expanduser("~"), "event_qr.db")
 DEFAULT_GUESTLIST_PATHS = ["Guestlist.csv", "Guestlist.xlsx", "guestlist.csv", "guestlist.xlsx"]
 CHECKPOINTS = ["BREAKFAST", "LUNCH", "GIFT"]
 
