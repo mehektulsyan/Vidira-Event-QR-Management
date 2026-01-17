@@ -979,6 +979,28 @@ def page_admin():
     st.dataframe(df, use_container_width=True)
     conn.close()
 
+    st.subheader("📥 Guestlist Loader")
+
+    path = find_default_guestlist_path()
+    st.write("Detected guestlist path:", path if path else "❌ Not found")
+    
+    if st.button("Load/Reload guestlist into DB", type="primary"):
+        if not path:
+            st.error("guestlist.csv not found in repo. Put it in repo root (same folder as app.py).")
+            st.stop()
+        companies = load_guestlist_from_disk(path)
+        # wipe & reload guest_companies so it is clean
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM guest_companies")
+        conn.commit()
+        conn.close()
+    
+        inserted = upsert_guest_companies(companies)
+        st.success(f"Guestlist loaded. Companies inserted: {inserted} (duplicates ignored).")
+        st.rerun()
+
+
 
 # ----------------------------
 # Main
