@@ -660,8 +660,141 @@ def render_scan_notice_autoclear(seconds: int = 2):
 # ----------------------------
 def page_registration():
     st.header("🧾 Registration")
-    # (Keeping registration as you already had; not changed here)
-    st.info("Registration page unchanged in this update. Use your existing working registration logic here.")
+
+    guest_companies = load_guest_companies()
+    allow_spot_company = st.toggle("Allow adding company on the spot", value=True)
+
+    if guest_companies:
+        q = st.text_input("Search company", placeholder="Type to search…")
+        filtered = guest_companies
+        if q.strip():
+            qq = q.strip().lower()
+            filtered = [c for c in guest_companies if qq in c.lower()]
+        company = st.selectbox("Select company", filtered if filtered else [""])
+        if allow_spot_company:
+            with st.expander("Add a company not in the list"):
+                new_company = st.text_input("New company name")
+                if st.button("Add company to guestlist"):
+                    nc = normalize_company(new_company)
+                    if not nc:
+                        st.error("Company name cannot be empty.")
+                    else:
+                        upsert_guest_companies([nc])
+                        st.success(f"Added '{nc}'.")
+                        st.rerun()
+    else:
+        st.warning("Guestlist is empty. Add companies in Admin or add on the spot.")
+        company = st.text_input("Company name *")
+
+    company_norm = normalize_company(company)
+    st.divider()
+
+    st.subheader("Main Member (Breakfast + Lunch + Gift)")
+    main_name = st.text_input("Main member name *")
+    main_phone_raw = st.text_input("Main member phone * (10 digits)")
+
+    st.divider()
+    st.subheader("Additional Members (Breakfast + Lunch only)")
+
+    if "extra_count" not in st.session_state:
+        st.session_state.extra_count = 0
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("➕ Add more"):
+            st.session_state.extra_count += 1
+    with c2:
+        if st.session_state.extra_count > 0 and st.button("➖ Remove last"):
+            st.session_state.extra_count -= 1
+
+    extras_raw = []
+    for i in range(st.session_state.extra_count):
+        st.markdown(f"**Extra member #{i+1}**")
+        n = st.text_input("Name *", key=f"ex_name_{i}")
+        p = st.text_input("Phone * (10 digits)", key=f"ex_phone_{i}")
+        extras_raw.append((n, p))
+
+    st.divider()
+
+    if st.button("✅ Submit + Send WhatsApp QRs", type="primary"):
+        if not company_norm:
+            st.error("Company is required.")
+            return
+        if not main_name.strip():
+            st.error("Main member name is required.")
+            return
+        main_phone10 = normalize_phone_10(main_phone_raw)
+        if not main_phone10:
+            st.error("Main phone must be exactly 10 digits (or include +91).")
+            return
+
+        existing = find_member_by_phone10(main_phone10)
+        if existing:
+            ex_name, _, ex_role, ex_company, ex_created = existing
+            st.error(f"QR already issued: **{ex_name}** / **{ex_company}** ({ex_role}) at {ex_created}")
+            return
+
+        seen = {main_phone10}
+        extra_norm = []
+        for n, p in extras_raw:
+            if not n.strip():
+                st.error("All extra names required.")
+                return
+            p10 = normalize_phone_10(p)
+            if not p10:
+                st.error("Each extra phone must be exactly 10 digits (or include +91).")
+                return
+            if p10 in seen:
+                st.error("Same phone entered twice in this registration.")
+                return
+            if find_member_by_phone10(p10):
+                st.error(f"Phone already has a QR: {p10}")
+                return
+            seen.add(p10)
+            extra_norm.append((n.strip(), p10))
+
+        if not company_in_guestlist(company_norm):
+            if allow_spot_company:
+                upsert_guest_companies([company_norm])
+                st.warning(f"Company '{company_norm}' was not in guestlist — added on spot.")
+            else:
+                st.error("Company not in guestlist.")
+                return
+
+        company_id = get_or_create_company(company_norm)
+
+        main_token = add_member(company_id, main_name, main_phone10, "MAIN")
+        set_entitlements(main_token, ["BREAKFAST", "LUNCH", "GIFT"])
+
+        extra_records = []
+        for n, p10 in extra_norm:
+            t = add_member(company_id, n, p10, "EXTRA")
+            set_entitlements(t, ["BREAKFAST", "LUNCH"])
+            extra_records.append((n, p10, t))
+
+        st.success("Registered. Sending WhatsApp QRs…")
+
+        if not _wa_ready():
+            st.error("WhatsApp API not configured in secrets.")
+            st.info(f"MAIN token: {main_token}")
+            return
+
+        try:
+            to = phone_to_e164_india(main_phone10)
+            media_id = wa_upload_media(make_qr_png_bytes(main_token))
+            wa_send_template_with_image_header(to, TEMPLATE_MAIN, TEMPLATE_LANG, media_id, [main_name, company_norm])
+            st.success(f"WhatsApp sent to MAIN: {main_name} ({to})")
+        except Exception as e:
+            st.error(f"Failed sending MAIN WhatsApp: {e}")
+
+        for n, p10, tok in extra_records:
+            try:
+                to = phone_to_e164_india(p10)
+                media_id = wa_upload_media(make_qr_png_bytes(tok))
+                wa_send_template_with_image_header(to, TEMPLATE_EXTRA, TEMPLATE_LANG, media_id, [n, company_norm])
+                st.success(f"WhatsApp sent to EXTRA: {n} ({to})")
+            except Exception as e:
+                st.error(f"Failed sending EXTRA WhatsApp to {n}: {e}")
 
 
 def page_scan():
