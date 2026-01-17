@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import secrets
+import time
 from datetime import datetime, timezone
 from io import BytesIO
 
@@ -68,7 +69,6 @@ def create_token() -> str:
 
 
 def beep(success: bool):
-    # browser audio beep (best effort)
     freq = 880 if success else 220
     st.components.v1.html(
         f"""
@@ -89,7 +89,7 @@ def beep(success: bool):
         }})();
         </script>
         """,
-        height=0
+        height=0,
     )
 
 
@@ -99,7 +99,7 @@ def beep(success: bool):
 def login_gate():
     if not APP_PASSWORD or not str(APP_PASSWORD).strip():
         st.error("APP_PASSWORD is missing in Streamlit secrets. App is locked until you set it.")
-        st.info("Go to Streamlit Cloud → App → Settings → Secrets and set APP_PASSWORD.")
+        st.info("Streamlit Cloud → App → Settings → Secrets → set APP_PASSWORD and reboot.")
         st.stop()
 
     if st.session_state.get("auth_ok"):
@@ -166,7 +166,6 @@ def migrate_schema(conn: sqlite3.Connection):
                     cur.execute("UPDATE members SET phone10=? WHERE id=?", (p10, mid))
                 conn.commit()
 
-    # Unique index may fail if old duplicates exist; so we try and ignore failure safely
     if _table_exists(cur, "members") and "phone10" in table_columns(cur, "members"):
         try:
             cur.execute("""
@@ -245,14 +244,12 @@ def init_db():
     )
     """)
 
-    # enforce "once per token per checkpoint" for breakfast/lunch
     cur.execute("""
     CREATE UNIQUE INDEX IF NOT EXISTS uq_token_checkpoint
     ON redemptions(token, checkpoint)
     WHERE token IS NOT NULL
     """)
 
-    # enforce "one gift per company"
     cur.execute("""
     CREATE UNIQUE INDEX IF NOT EXISTS uq_company_gift
     ON redemptions(company_id, checkpoint)
@@ -468,7 +465,7 @@ def count_breakdown(checkpoint: str):
 
 
 # ----------------------------
-# Redemption (FIXED feedback + correct counting)
+# Redemption
 # ----------------------------
 def redeem(token: str, checkpoint: str, device: str = ""):
     token = (token or "").strip().replace("\n", "").replace("\r", "")
@@ -511,7 +508,7 @@ def redeem(token: str, checkpoint: str, device: str = ""):
 
 
 # ----------------------------
-# QR generation + WhatsApp
+# QR + WhatsApp
 # ----------------------------
 def make_qr_png_bytes(data: str) -> bytes:
     qr = qrcode.QRCode(
@@ -546,8 +543,13 @@ def wa_upload_media(png_bytes: bytes) -> str:
     return r.json()["id"]
 
 
-def wa_send_template_with_image_header(to_e164: str, template_name: str, lang_code: str,
-                                       header_image_media_id: str, body_params: list[str]):
+def wa_send_template_with_image_header(
+    to_e164: str,
+    template_name: str,
+    lang_code: str,
+    header_image_media_id: str,
+    body_params: list[str],
+):
     url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {
@@ -572,6 +574,10 @@ def wa_send_template_with_image_header(to_e164: str, template_name: str, lang_co
 # ----------------------------
 # Guestlist disk helpers
 # ----------------------------
+def load_guest_companies_db() -> list[str]:
+    return load_guest_companies()
+
+
 def _norm_col(c) -> str:
     return str(c).strip().lower().replace("\n", " ").replace("_", " ").replace("-", " ")
 
@@ -624,14 +630,25 @@ def ensure_guestlist_loaded_once():
 
 
 # ----------------------------
-# UI Helpers (big scan notification)
+# Scan Notice (auto-clear after 2s)
 # ----------------------------
-def render_scan_notice():
-    """
-    Shows a BIG banner for last scan result.
-    """
+def set_scan_notice(color: str, title: str, subtitle: str):
+    st.session_state.last_scan_result = (color, title, subtitle)
+    st.session_state.last_scan_ts = time.time()
+
+
+def render_scan_notice_autoclear(seconds: int = 2):
+    ts = st.session_state.get("last_scan_ts")
     res = st.session_state.get("last_scan_result")
-    if not res:
+
+    if not ts or not res:
+        st.info("Ready to scan…")
+        return
+
+    # auto-clear
+    if time.time() - ts >= seconds:
+        st.session_state.last_scan_result = None
+        st.session_state.last_scan_ts = None
         st.info("Ready to scan…")
         return
 
@@ -647,6 +664,7 @@ def render_scan_notice():
 # ----------------------------
 def page_registration():
     st.header("🧾 Registration")
+
     guest_companies = load_guest_companies()
     allow_spot_company = st.toggle("Allow adding company on the spot", value=True)
 
@@ -765,25 +783,19 @@ def page_registration():
             st.info(f"MAIN token: {main_token}")
             return
 
-        # Send main
         try:
             to = phone_to_e164_india(main_phone10)
             media_id = wa_upload_media(make_qr_png_bytes(main_token))
-            wa_send_template_with_image_header(
-                to, TEMPLATE_MAIN, TEMPLATE_LANG, media_id, [main_name, company_norm]
-            )
+            wa_send_template_with_image_header(to, TEMPLATE_MAIN, TEMPLATE_LANG, media_id, [main_name, company_norm])
             st.success(f"WhatsApp sent to MAIN: {main_name} ({to})")
         except Exception as e:
             st.error(f"Failed sending MAIN WhatsApp: {e}")
 
-        # Send extras
         for n, p10, tok in extra_records:
             try:
                 to = phone_to_e164_india(p10)
                 media_id = wa_upload_media(make_qr_png_bytes(tok))
-                wa_send_template_with_image_header(
-                    to, TEMPLATE_EXTRA, TEMPLATE_LANG, media_id, [n, company_norm]
-                )
+                wa_send_template_with_image_header(to, TEMPLATE_EXTRA, TEMPLATE_LANG, media_id, [n, company_norm])
                 st.success(f"WhatsApp sent to EXTRA: {n} ({to})")
             except Exception as e:
                 st.error(f"Failed sending EXTRA WhatsApp to {n}: {e}")
@@ -795,6 +807,38 @@ def page_scan():
     checkpoint = st.radio("Select Counter", CHECKPOINTS, horizontal=True)
     device = st.text_input("Device name (optional)", placeholder="e.g. breakfast-1 / lunch-1 / gift-1")
 
+    st.divider()
+
+    # CAMERA FIRST (mobile)
+    st.subheader("Phone Camera Scan")
+    st.caption("If camera box doesn't appear, add `streamlit-qrcode-scanner` in requirements.txt and redeploy.")
+
+    scanned = None
+    try:
+        from streamlit_qrcode_scanner import qrcode_scanner
+        scanned = qrcode_scanner(key="qr_scanner")
+    except Exception:
+        st.warning("Camera scanner not available. Install `streamlit-qrcode-scanner` and redeploy.")
+
+    if scanned:
+        color, title, subtitle = redeem(scanned, checkpoint, device)
+        set_scan_notice(color, title, subtitle)
+
+        try:
+            st.toast(f"{'✅' if color=='green' else '❌'} {title} — {subtitle}",
+                     icon="✅" if color == "green" else "❌")
+        except Exception:
+            pass
+
+        beep(color == "green")
+        st.rerun()
+
+    # NOTICE DIRECTLY BELOW SCANNER + AUTO-CLEAR IN 2s
+    render_scan_notice_autoclear(seconds=2)
+
+    st.divider()
+
+    # COUNTS
     b_qr, b_ff = count_breakdown("BREAKFAST")
     l_qr, l_ff = count_breakdown("LUNCH")
     g_total, _ = count_breakdown("GIFT")
@@ -806,12 +850,7 @@ def page_scan():
 
     st.divider()
 
-    # BIG notification area
-    render_scan_notice()
-
-    st.divider()
-
-    # Friends & Family manual count
+    # FRIENDS & FAMILY
     st.subheader("👪 Friends & Family (No QR) — Manual Plate Count")
     ff_counter = st.selectbox("Add to", ["BREAKFAST", "LUNCH"], key="ff_counter")
     ff_note = st.text_input("Note (optional)", placeholder="Family / VIP / Staff", key="ff_note")
@@ -820,13 +859,15 @@ def page_scan():
     with c1:
         if st.button("➕ +1", use_container_width=True):
             add_manual_count(ff_counter, 1, "FAMILY", ff_note, device)
-            st.session_state.last_scan_result = ("green", "COUNT ADDED", f"{ff_counter}: +1 (Friends & Family)")
+            set_scan_notice("green", "COUNT ADDED", f"{ff_counter}: +1 (Friends & Family)")
+            st.toast(f"✅ COUNT ADDED — {ff_counter}: +1", icon="✅")
             beep(True)
             st.rerun()
     with c2:
         if st.button("➕ +5", use_container_width=True):
             add_manual_count(ff_counter, 5, "FAMILY", ff_note, device)
-            st.session_state.last_scan_result = ("green", "COUNT ADDED", f"{ff_counter}: +5 (Friends & Family)")
+            set_scan_notice("green", "COUNT ADDED", f"{ff_counter}: +5 (Friends & Family)")
+            st.toast(f"✅ COUNT ADDED — {ff_counter}: +5", icon="✅")
             beep(True)
             st.rerun()
     with c3:
@@ -834,57 +875,39 @@ def page_scan():
     with c4:
         if st.button("Add Qty", use_container_width=True):
             add_manual_count(ff_counter, int(qty), "FAMILY", ff_note, device)
-            st.session_state.last_scan_result = ("green", "COUNT ADDED", f"{ff_counter}: +{int(qty)} (Friends & Family)")
+            set_scan_notice("green", "COUNT ADDED", f"{ff_counter}: +{int(qty)} (Friends & Family)")
+            st.toast(f"✅ COUNT ADDED — {ff_counter}: +{int(qty)}", icon="✅")
             beep(True)
             st.rerun()
 
     if st.button("↩️ Undo last Friends & Family add"):
         ok, msg = undo_last_manual_count("FAMILY", device)
-        st.session_state.last_scan_result = ("green" if ok else "red", "UNDO" if ok else "UNDO FAILED", msg)
+        set_scan_notice("green" if ok else "red", "UNDO" if ok else "UNDO FAILED", msg)
+        st.toast(f"{'✅' if ok else '❌'} {msg}", icon="✅" if ok else "❌")
         beep(ok)
-        st.rerun()
-
-    st.divider()
-
-    st.subheader("Phone Camera Scan")
-    st.caption("If camera box doesn't appear, add `streamlit-qrcode-scanner` in requirements.txt and redeploy.")
-
-    try:
-        from streamlit_qrcode_scanner import qrcode_scanner
-        scanned = qrcode_scanner(key="qr_scanner")
-    except Exception:
-        scanned = None
-        st.warning("Camera scanner not available. Install `streamlit-qrcode-scanner` and redeploy.")
-
-    if scanned:
-        color, title, subtitle = redeem(scanned, checkpoint, device)
-        st.session_state.last_scan_result = (color, title, subtitle)
-        beep(color == "green")
         st.rerun()
 
 
 def page_admin():
     st.header("🛠️ Admin")
 
-    # Reset options (TESTING vs EVENT)
     st.subheader("⚠️ Reset Database (Testing / Before Event)")
-    st.caption("Use ONLY before the event. This will delete all registrations + scans + manual counts.")
+    st.caption("HARD RESET deletes DB file. SOFT RESET clears data but keeps guestlist.")
 
     colA, colB = st.columns(2)
-
     with colA:
         if st.button("🧨 HARD RESET (Delete DB file)", type="primary"):
             if os.path.exists(DB_PATH):
                 os.remove(DB_PATH)
             st.session_state.last_scan_result = None
-            st.success("DB file deleted. App will reinitialize fresh now.")
+            st.session_state.last_scan_ts = None
+            st.success("DB deleted. Fresh start.")
             st.rerun()
 
     with colB:
         if st.button("🧼 SOFT RESET (Clear tables)", type="secondary"):
             conn = get_conn()
             cur = conn.cursor()
-            # keep guest_companies intact (optional)
             cur.execute("DELETE FROM redemptions")
             cur.execute("DELETE FROM manual_counts")
             cur.execute("DELETE FROM entitlements")
@@ -893,7 +916,8 @@ def page_admin():
             conn.commit()
             conn.close()
             st.session_state.last_scan_result = None
-            st.success("Tables cleared (guestlist kept).")
+            st.session_state.last_scan_ts = None
+            st.success("Cleared registrations + scans (guestlist kept).")
             st.rerun()
 
     st.divider()
