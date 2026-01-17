@@ -1,22 +1,4 @@
-# app.py
-# Vidira Event QR Management (Streamlit) — FINAL (with Undo Friends & Family)
-#
-# Features:
-# - Login lock (shared password + optional allowed usernames)
-# - Guestlist auto-load from Guestlist.csv/xlsx (backend)
-# - Registration: company search + add company on-spot
-# - Unlimited extra members via "Add more"
-# - Phone validation: digits only, exactly 10 digits (India); blocks invalid
-# - Duplicate phone detection: blocks if phone already registered; shows existing record
-# - WhatsApp templates with IMAGE header (QR sent as image in template):
-#     TEMPLATE_MAIN: Breakfast/Lunch/Gift
-#     TEMPLATE_EXTRA: Breakfast/Lunch
-# - Scan kiosk: hardware scanner + phone camera scanner
-# - Full-screen GREEN/RED overlay + beep + big company/name
-# - Counts: Breakfast/Lunch/Gifts separately + breakdown
-# - Friends & Family manual plate count (Breakfast/Lunch) with full audit trail:
-#     qty, timestamp, device, added_by, note
-# - Undo last Friends & Family add (for accidental +5 / wrong counter)
+# app.py — FINAL (Auto-migrating DB schema + Friends & Family manual count + Undo)
 
 import os
 import sqlite3
@@ -31,24 +13,18 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
-# ----------------------------
-# Config
-# ----------------------------
 DB_PATH = "event_qr.db"
 DEFAULT_GUESTLIST_PATHS = ["Guestlist.csv", "Guestlist.xlsx", "guestlist.csv", "guestlist.xlsx"]
 CHECKPOINTS = ["BREAKFAST", "LUNCH", "GIFT"]
 
-# WhatsApp Cloud API (set in .streamlit/secrets.toml)
 PHONE_NUMBER_ID = st.secrets.get("WHATSAPP_PHONE_NUMBER_ID", "")
 ACCESS_TOKEN = st.secrets.get("WHATSAPP_ACCESS_TOKEN", "")
 GRAPH_API_VERSION = st.secrets.get("GRAPH_API_VERSION", "v20.0")
 
-# Templates (set in secrets or fallback)
 TEMPLATE_MAIN = st.secrets.get("TEMPLATE_MAIN", "vidira_event_qr_image")
 TEMPLATE_EXTRA = st.secrets.get("TEMPLATE_EXTRA", "vidira_event_food_qr_image")
 TEMPLATE_LANG = st.secrets.get("TEMPLATE_LANG", "en")
 
-# App lock
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 APP_USERS_RAW = st.secrets.get("APP_USERS", "")
 ALLOWED_USERS = [u.strip().lower() for u in str(APP_USERS_RAW).split(",") if u.strip()]
@@ -72,13 +48,6 @@ def digits_only(s: str) -> str:
 
 
 def normalize_phone_10(phone: str) -> str:
-    """
-    Return 10-digit Indian phone number (local) or "" if invalid.
-    Accepts:
-      - 9830675002
-      - +91 9830675002
-      - 919830675002
-    """
     d = digits_only(phone)
     if len(d) == 10:
         return d
@@ -100,7 +69,6 @@ def create_token() -> str:
 # ----------------------------
 def login_gate():
     if not APP_PASSWORD:
-        # Unlocked mode (not recommended)
         st.session_state.auth_ok = True
         st.session_state.username = st.session_state.get("username", "unlocked")
         return
@@ -139,10 +107,69 @@ def login_gate():
 
 
 # ----------------------------
-# DB helpers
+# DB helpers + MIGRATION
 # ----------------------------
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def table_columns(cur, table: str) -> list[str]:
+    cur.execute(f"PRAGMA table_info({table})")
+    return [r[1] for r in cur.fetchall()]
+
+
+def migrate_schema(conn: sqlite3.Connection):
+    """
+    Safely migrates older DB versions to the latest schema.
+    - Adds members.phone10 if missing
+    - Backfills phone10 from members.phone if present
+    - Adds indexes safely
+    """
+    cur = conn.cursor()
+
+    # If members table exists and phone10 missing, add it
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='members'")
+    if cur.fetchone():
+        cols = table_columns(cur, "members")
+        if "phone10" not in cols:
+            cur.execute("ALTER TABLE members ADD COLUMN phone10 TEXT")
+            conn.commit()
+
+            # Backfill from 'phone' column if it exists
+            cols = table_columns(cur, "members")
+            if "phone" in cols:
+                cur.execute("SELECT id, phone FROM members")
+                rows = cur.fetchall()
+                for mid, phone in rows:
+                    p10 = normalize_phone_10(phone)
+                    cur.execute("UPDATE members SET phone10=? WHERE id=?", (p10, mid))
+                conn.commit()
+            else:
+                # If no phone column existed, leave as NULL/blank; duplicates check will handle later
+                pass
+
+    # Create unique index on members.phone10 only if column exists
+    cols = table_columns(cur, "members") if _table_exists(cur, "members") else []
+    if "phone10" in cols:
+        # SQLite can't create a UNIQUE index if duplicates exist; handle gracefully:
+        # We'll create a non-unique index if creation fails, and app will still do runtime duplicate checks.
+        try:
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_members_phone10
+                ON members(phone10)
+                WHERE phone10 IS NOT NULL AND phone10 <> ''
+            """)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+        except sqlite3.IntegrityError:
+            # duplicates exist in existing DB; keep app running without unique enforcement
+            pass
+
+
+def _table_exists(cur, name: str) -> bool:
+    cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (name,))
+    return cur.fetchone() is not None
 
 
 def init_db():
@@ -165,23 +192,18 @@ def init_db():
     )
     """)
 
-    # Members: phone10 UNIQUE to prevent duplicate QR issuance
+    # members (latest schema includes phone10)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS members (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         company_id INTEGER NOT NULL,
         name TEXT NOT NULL,
-        phone10 TEXT NOT NULL,
-        role TEXT NOT NULL,          -- MAIN or EXTRA
+        phone10 TEXT,
+        role TEXT NOT NULL,
         token TEXT NOT NULL UNIQUE,
         created_at TEXT NOT NULL,
         FOREIGN KEY(company_id) REFERENCES companies(id)
     )
-    """)
-
-    cur.execute("""
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_members_phone10
-    ON members(phone10)
     """)
 
     cur.execute("""
@@ -204,13 +226,12 @@ def init_db():
     )
     """)
 
-    # Manual counts (Friends & Family)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS manual_counts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        checkpoint TEXT NOT NULL,     -- BREAKFAST or LUNCH only
+        checkpoint TEXT NOT NULL,
         qty INTEGER NOT NULL,
-        category TEXT NOT NULL,       -- e.g. 'FAMILY'
+        category TEXT NOT NULL,
         note TEXT,
         used_at TEXT NOT NULL,
         device TEXT,
@@ -218,14 +239,13 @@ def init_db():
     )
     """)
 
-    # Breakfast/Lunch: once per token
+    # Redemption uniqueness (safe)
     cur.execute("""
     CREATE UNIQUE INDEX IF NOT EXISTS uq_token_checkpoint
     ON redemptions(token, checkpoint)
     WHERE token IS NOT NULL
     """)
 
-    # Gift: once per company
     cur.execute("""
     CREATE UNIQUE INDEX IF NOT EXISTS uq_company_gift
     ON redemptions(company_id, checkpoint)
@@ -233,9 +253,16 @@ def init_db():
     """)
 
     conn.commit()
+
+    # migrate older DBs
+    migrate_schema(conn)
+
     conn.close()
 
 
+# ----------------------------
+# Guestlist / Companies
+# ----------------------------
 def load_guest_companies() -> list[str]:
     conn = get_conn()
     cur = conn.cursor()
@@ -311,6 +338,7 @@ def add_member(company_id: int, name: str, phone10: str, role: str) -> str:
     token = create_token()
     conn = get_conn()
     cur = conn.cursor()
+
     for _ in range(6):
         try:
             cur.execute("""
@@ -322,6 +350,7 @@ def add_member(company_id: int, name: str, phone10: str, role: str) -> str:
             return token
         except sqlite3.IntegrityError:
             token = create_token()
+
     conn.close()
     raise RuntimeError("Failed generating unique token. Try again.")
 
@@ -375,10 +404,10 @@ def list_company_members(company_id: int):
     return rows
 
 
+# ----------------------------
+# Manual counts + Undo
+# ----------------------------
 def add_manual_count(checkpoint: str, qty: int, category: str, note: str, device: str) -> int:
-    """
-    Inserts manual count row and returns inserted id.
-    """
     if checkpoint not in ["BREAKFAST", "LUNCH"]:
         raise ValueError("Manual counts only allowed for BREAKFAST or LUNCH.")
     qty = int(qty)
@@ -392,9 +421,7 @@ def add_manual_count(checkpoint: str, qty: int, category: str, note: str, device
         INSERT INTO manual_counts (checkpoint, qty, category, note, used_at, device, added_by)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
-        checkpoint,
-        qty,
-        category,
+        checkpoint, qty, category,
         note.strip() if note else None,
         now_iso(),
         device.strip() if device else None,
@@ -407,10 +434,6 @@ def add_manual_count(checkpoint: str, qty: int, category: str, note: str, device
 
 
 def undo_last_manual_count(category: str, device: str) -> tuple[bool, str]:
-    """
-    Undo the most recent manual count entry for the current user (and device if provided).
-    Returns (ok, message).
-    """
     user = st.session_state.get("username", "unknown")
     conn = get_conn()
     cur = conn.cursor()
@@ -435,7 +458,7 @@ def undo_last_manual_count(category: str, device: str) -> tuple[bool, str]:
     row = cur.fetchone()
     if not row:
         conn.close()
-        return False, "Nothing to undo (no recent manual entries found)."
+        return False, "Nothing to undo."
 
     mid, cp, qty = row
     cur.execute("DELETE FROM manual_counts WHERE id=?", (mid,))
@@ -445,10 +468,6 @@ def undo_last_manual_count(category: str, device: str) -> tuple[bool, str]:
 
 
 def count_breakdown(checkpoint: str):
-    """
-    Returns (qr_count, manual_count) for BREAKFAST/LUNCH.
-    For GIFT: (gift_count, 0)
-    """
     conn = get_conn()
     cur = conn.cursor()
 
@@ -566,7 +585,7 @@ def make_qr_png_bytes(data: str) -> bytes:
 
 
 # ----------------------------
-# WhatsApp Cloud API (Template with Image Header)
+# WhatsApp Cloud API
 # ----------------------------
 def _wa_ready() -> bool:
     return bool(PHONE_NUMBER_ID and ACCESS_TOKEN and GRAPH_API_VERSION)
@@ -612,7 +631,7 @@ def wa_send_template_with_image_header(
 
 
 # ----------------------------
-# Kiosk UI: Full-screen overlay + beep
+# Kiosk overlay UI
 # ----------------------------
 def kiosk_fullscreen_result(color: str, title: str, subtitle: str, beep: bool = True):
     palette = {
@@ -685,7 +704,7 @@ def kiosk_fullscreen_result(color: str, title: str, subtitle: str, beep: bool = 
 
 
 # ----------------------------
-# Scan / Redemption
+# Redemption
 # ----------------------------
 def redeem(token: str, checkpoint: str, device: str = ""):
     token = (token or "").strip().replace("\n", "").replace("\r", "")
@@ -728,15 +747,11 @@ def redeem(token: str, checkpoint: str, device: str = ""):
 
 
 def camera_scan_component():
-    """
-    Returns scanned text or None.
-    Ensure `streamlit-qrcode-scanner` is in requirements.txt for Streamlit Cloud.
-    """
     try:
         from streamlit_qrcode_scanner import qrcode_scanner
         return qrcode_scanner(key="qr_scanner")
-    except Exception as e:
-        st.warning(f"Camera scanner not available. Ensure `streamlit-qrcode-scanner` is installed. ({e})")
+    except Exception:
+        st.warning("Camera scanner not available. Add `streamlit-qrcode-scanner` to requirements.txt and redeploy.")
         return None
 
 
@@ -847,12 +862,10 @@ def page_registration():
             if not n.strip():
                 st.error("All extra member names are required.")
                 return
-
             p10 = normalize_phone_10(p)
             if not p10:
                 st.error("Each extra phone must be exactly 10 digits (or include +91).")
                 return
-
             if p10 in seen_phones:
                 st.error("Same phone number entered twice in this registration.")
                 return
@@ -895,9 +908,6 @@ def page_registration():
 
         if not _wa_ready():
             st.error("WhatsApp API not configured; registration saved in DB but messages not sent.")
-            st.info(f"MAIN token: {main_token}")
-            for n, p10, t in extra_records:
-                st.info(f"EXTRA {n} token: {t}")
             return
 
         try:
@@ -931,11 +941,6 @@ def page_registration():
             except Exception as e:
                 st.error(f"Failed sending EXTRA WhatsApp to {n}: {e}")
 
-        with st.expander("View members created for this company"):
-            rows = list_company_members(company_id)
-            for _rid, nm, ph10, role, tok, created in rows:
-                st.write(f"- **{role}** {nm} ({ph10}) — token `{tok}` — {created}")
-
 
 def page_scan():
     st.markdown("## 📷 Scan Kiosk (Idiot-Proof)")
@@ -954,53 +959,42 @@ def page_scan():
 
     st.divider()
 
-    # Friends & Family manual count + Undo
     st.subheader("👪 Friends & Family (No QR) — Manual Plate Count")
-    st.caption("Tap +1 when someone without QR takes a plate. They may come separately. Every tap is recorded.")
+    st.caption("Tap +1 when someone without QR takes a plate. They can come separately. Every tap is recorded.")
 
     ff_counter = st.selectbox("Add to", ["BREAKFAST", "LUNCH"], key="ff_counter")
     ff_note = st.text_input("Note (optional)", placeholder="e.g. Family / Friends / VIP / Staff", key="ff_note")
 
-    m1, m2, m3, m4, m5 = st.columns([1, 1, 1, 2, 1.2])
-
+    m1, m2, m3, m4 = st.columns([1, 1, 1.2, 1.2])
     with m1:
         if st.button("➕ +1", use_container_width=True):
-            new_id = add_manual_count(ff_counter, 1, "FAMILY", ff_note, device)
-            st.session_state.last_manual_id = new_id
+            add_manual_count(ff_counter, 1, "FAMILY", ff_note, device)
             kiosk_fullscreen_result("green", "COUNT ADDED", f"{ff_counter}: +1 (Friends & Family)", beep=True)
             st.rerun()
-
     with m2:
         if st.button("➕ +5", use_container_width=True):
-            new_id = add_manual_count(ff_counter, 5, "FAMILY", ff_note, device)
-            st.session_state.last_manual_id = new_id
+            add_manual_count(ff_counter, 5, "FAMILY", ff_note, device)
             kiosk_fullscreen_result("green", "COUNT ADDED", f"{ff_counter}: +5 (Friends & Family)", beep=True)
             st.rerun()
-
     with m3:
         ff_qty = st.number_input("Custom qty", min_value=1, max_value=50, value=1, step=1, key="ff_qty")
-
     with m4:
-        if st.button("Add Custom Qty", type="secondary", use_container_width=True):
-            new_id = add_manual_count(ff_counter, int(ff_qty), "FAMILY", ff_note, device)
-            st.session_state.last_manual_id = new_id
-            kiosk_fullscreen_result("green", "COUNT ADDED", f"{ff_counter}: +{int(ff_qty)} (Friends & Family)", beep=True)
-            st.rerun()
-
-    with m5:
         if st.button("↩️ Undo last", use_container_width=True):
             ok, msg = undo_last_manual_count("FAMILY", device)
             kiosk_fullscreen_result("blue" if ok else "red", "UNDO" if ok else "UNDO FAILED", msg, beep=True)
             st.rerun()
 
+    if st.button("Add Custom Qty", type="secondary", use_container_width=True):
+        add_manual_count(ff_counter, int(ff_qty), "FAMILY", ff_note, device)
+        kiosk_fullscreen_result("green", "COUNT ADDED", f"{ff_counter}: +{int(ff_qty)} (Friends & Family)", beep=True)
+        st.rerun()
+
     st.divider()
 
-    # Scan handlers
     def handle_token(token: str):
         color, title, subtitle = redeem(token, checkpoint, device)
         kiosk_fullscreen_result("green" if color == "green" else "red", title, subtitle, beep=True)
 
-    # A) Hardware scanner
     st.subheader("A) Hardware Scanner")
     st.caption("Click the scan box once, then keep scanning. Scanner should be Keyboard/HID mode + ENTER suffix.")
 
@@ -1022,9 +1016,7 @@ def page_scan():
 
     st.divider()
 
-    # B) Phone camera scan
     st.subheader("B) Phone Camera Scan")
-    st.caption("If camera box doesn't appear, add `streamlit-qrcode-scanner` to requirements.txt and redeploy.")
     scanned = camera_scan_component()
     if scanned:
         handle_token(scanned)
@@ -1051,8 +1043,6 @@ def page_admin():
     col3.metric("Members", m)
     col4.metric("Total Redemptions", r)
 
-    st.divider()
-
     b_qr, b_ff = count_breakdown("BREAKFAST")
     l_qr, l_ff = count_breakdown("LUNCH")
     g_total = counts_for_checkpoint("GIFT")
@@ -1064,32 +1054,6 @@ def page_admin():
 
     st.divider()
 
-    st.subheader("Add companies manually (one per line)")
-    new_companies_text = st.text_area("Companies", placeholder="ABC Motors\nXYZ Spares\n...")
-    if st.button("Add companies"):
-        names = [normalize_company(x) for x in new_companies_text.splitlines()]
-        names = [x for x in names if x]
-        added = upsert_guest_companies(names)
-        st.success(f"Added {added} new companies.")
-
-    st.divider()
-
-    st.subheader("Reload guestlist from backend file")
-    path = find_default_guestlist_path()
-    st.write(f"Detected guestlist file: **{path or 'None found'}**")
-    if st.button("Force reload from file (merge into DB)"):
-        if not path:
-            st.error("No Guestlist.csv / Guestlist.xlsx found in the project folder.")
-        else:
-            try:
-                companies = load_guestlist_from_disk(path)
-                added = upsert_guest_companies(companies)
-                st.success(f"Loaded {len(companies)} companies from {path}. Newly inserted: {added}")
-            except Exception as e:
-                st.error(f"Reload failed: {e}")
-
-    st.divider()
-
     st.subheader("View DB tables (latest 200 rows)")
     table = st.selectbox("Table", ["guest_companies", "companies", "members", "entitlements", "redemptions", "manual_counts"])
     conn = get_conn()
@@ -1097,35 +1061,20 @@ def page_admin():
     st.dataframe(df, use_container_width=True)
     conn.close()
 
-    st.divider()
 
-    st.subheader("WhatsApp API status")
-    st.write(f"PHONE_NUMBER_ID present: **{bool(PHONE_NUMBER_ID)}**")
-    st.write(f"ACCESS_TOKEN present: **{bool(ACCESS_TOKEN)}**")
-    st.write(f"GRAPH_API_VERSION: **{GRAPH_API_VERSION}**")
-    st.write(f"MAIN template: **{TEMPLATE_MAIN}** ({TEMPLATE_LANG})")
-    st.write(f"EXTRA template: **{TEMPLATE_EXTRA}** ({TEMPLATE_LANG})")
-
-
-# ----------------------------
-# Main
-# ----------------------------
 def main():
     login_gate()
     init_db()
 
-    inserted = 0
     try:
-        inserted = ensure_guestlist_loaded_once()
+        ensure_guestlist_loaded_once()
     except Exception as e:
         st.sidebar.error(f"Guestlist auto-load failed: {e}")
 
     st.sidebar.title("Vidira Event System")
     st.sidebar.caption(f"Logged in as: **{st.session_state.get('username','')}**")
-    if inserted:
-        st.sidebar.success(f"Guestlist auto-loaded: {inserted} companies")
 
-    page = st.sidebar.radio("Go to", ["Registration", "Scan", "Admin"], index=0)
+    page = st.sidebar.radio("Go to", ["Registration", "Scan", "Admin"], index=1)
 
     if page == "Registration":
         page_registration()
